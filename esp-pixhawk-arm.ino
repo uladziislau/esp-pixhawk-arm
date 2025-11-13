@@ -1,360 +1,233 @@
-#include <checksum.h>
-#include <SoftwareSerial.h>
+// Unified cross-platform sketch (ESP32/ESP8266) with AsyncWebServer, SSE, WiFiManager, OTA
+#include <Arduino.h>
+
+// Uncomment to enable AP-only mode with fixed IP
+// #define AP_ONLY_MODE
+
+#if defined(ARDUINO_ARCH_ESP32)
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPmDNS.h>
+#else
 #include <ESP8266WiFi.h>
-#include <DNSServer.h>
-#include <standard/mavlink.h>
-#include <String.h>
+#include <ESPAsyncTCP.h>
+#include <ESP8266mDNS.h>
+#include <SoftwareSerial.h>
+#endif
 
-// Network credentials
-const char* ssid     = "DroneEspModule";
-const char* password = "";
+#include <ESPAsyncWebServer.h>
+#include <ArduinoOTA.h>
+#include <WiFiManager.h>
+#include <mavlink.h>
 
-IPAddress apIP(172, 217, 28, 1);
-IPAddress netMsk(255, 255, 255, 0);
+AsyncWebServer server(80);
+AsyncEventSource events("/events");
 
-DNSServer dnsServer;
-const byte DNS_PORT = 53;
+#if defined(ARDUINO_ARCH_ESP32)
+HardwareSerial SerialMAV(2);
+#ifndef MAV_RX_PIN
+#define MAV_RX_PIN 16
+#endif
+#ifndef MAV_TX_PIN
+#define MAV_TX_PIN 17
+#endif
+#else
+#ifndef MAV_RX_PIN
+#define MAV_RX_PIN 5
+#endif
+#ifndef MAV_TX_PIN
+#define MAV_TX_PIN 4
+#endif
+SoftwareSerial SerialMAV(MAV_RX_PIN, MAV_TX_PIN);
+#endif
 
-WiFiServer server(80);
+volatile bool isArmed = false;
+uint32_t customMode = 0;
+uint8_t targetSystem = 1;
+uint8_t targetComponent = 1;
+String lastAckText = "";
 
-// Variable to store the HTTP request
-String header;
+static const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ESP-Pixhawk-Arm</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px}
+    #status{font-weight:700}
+    .armed{color:#087f23}
+    .disarmed{color:#b00020}
+    button{margin-right:8px;padding:8px 12px}
+    #msg{color:#666;font-size:14px;margin-top:10px}
+    .mode-controls{margin-top:15px}
+    .mode-controls button{background:#f0f0f0;border:1px solid #ccc}
+  </style>
+  <script>
+    let es;
+    async function getStatus(){
+      try{const r=await fetch('/status');if(!r.ok)throw 0;const d=await r.json();apply(d)}catch(e){const el=document.getElementById('status');el.textContent='ERROR';el.className='disarmed'}
+    }
+    function apply(d){const el=document.getElementById('status');el.textContent=d.armed?'ARMED':'DISARMED';el.className=d.armed?'armed':'disarmed'}
+    function showMsg(text){const el=document.getElementById('msg');el.textContent=text;setTimeout(()=>el.textContent='',3000)}
+    async function post(path){const bs=document.querySelectorAll('button');bs.forEach(b=>b.disabled=true);try{await fetch(path,{method:'POST'});showMsg('Command sent')}catch(e){showMsg('Error')}finally{bs.forEach(b=>b.disabled=false)}}
+    window.addEventListener('DOMContentLoaded',()=>{
+      document.getElementById('arm').addEventListener('click',()=>post('/arm'))
+      document.getElementById('disarm').addEventListener('click',()=>post('/disarm'))
+      document.getElementById('rtl').addEventListener('click',()=>post('/mode/rtl'))
+      document.getElementById('stabilize').addEventListener('click',()=>post('/mode/stabilize'))
+      document.getElementById('althold').addEventListener('click',()=>post('/mode/alt_hold'))
+      if('EventSource' in window){
+        es=new EventSource('/events');
+        es.addEventListener('status',e=>{try{apply(JSON.parse(e.data))}catch(_){}})
+        es.addEventListener('ack',e=>{try{const d=JSON.parse(e.data);if(d.text)showMsg(d.text)}catch(_){}})
+      }
+      getStatus()
+    })
+  </script>
+</head>
+<body>
+  <h2>ESP-Pixhawk-Arm</h2>
+  <h4>Status: <span id="status" class="disarmed">DISARMED</span></h4>
+  <div id="msg"></div>
+  <div>
+    <button id="arm">ARM</button>
+    <button id="disarm">DISARM</button>
+  </div>
+  <div class="mode-controls">
+    <button id="rtl">RTL</button>
+    <button id="stabilize">STABILIZE</button>
+    <button id="althold">ALT HOLD</button>
+  </div>
+</body>
+</html>
+)rawliteral";
 
-String ArmedState = "DISARMED";
-String ModeState = "STABILIZE";
+void notifyStatus() {
+  String s = String("{\"armed\":") + (isArmed ? "true" : "false") + ",\"mode\":" + String(customMode) + "}";
+  events.send(s.c_str(), "status");
+}
 
-String StatusMessage = "";
+void notifyAck(const String& text) {
+  String escaped = text;
+  escaped.replace("\"", "\\\"");
+  escaped.replace("\\", "\\\\");
+  escaped.replace("\n", "\\n");
+  escaped.replace("\r", "\\r");
+  escaped.replace("\t", "\\t");
+  String s = String("{\"text\":\"") + escaped + "\"}";
+  events.send(s.c_str(), "ack");
+}
 
-bool pixhawk_heartbeat_message_geted = false;
-bool pixhawk_ack_message_geted = false;
+void sendMavlinkCommand(uint16_t command, float param1) {
+  if (!SerialMAV) return;
+  mavlink_message_t m; uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+  mavlink_msg_command_long_pack(255, 190, &m, targetSystem, targetComponent, command, 0, param1, 0, 0, 0, 0, 0, 0);
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &m);
+  SerialMAV.write(buf, len);
+}
 
-SoftwareSerial SerialMAV(5,16);
+void handleMavlink() {
+  while (SerialMAV.available()) {
+    uint8_t c = SerialMAV.read();
+    static mavlink_message_t msg; static mavlink_status_t st;
+    if (mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &st)) {
+      if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+        mavlink_heartbeat_t hb; mavlink_msg_heartbeat_decode(&msg, &hb);
+        bool prev = isArmed; isArmed = (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED) != 0; customMode = hb.custom_mode;
+        if (isArmed != prev) notifyStatus();
+      } else if (msg.msgid == MAVLINK_MSG_ID_COMMAND_ACK) {
+        mavlink_command_ack_t ack; mavlink_msg_command_ack_decode(&msg, &ack);
+        String result = "CMD " + String(ack.command) + ": ";
+        switch (ack.result) {
+          case MAV_RESULT_ACCEPTED: result += "ACCEPTED"; break;
+          case MAV_RESULT_TEMPORARILY_REJECTED: result += "REJECTED"; break;
+          case MAV_RESULT_DENIED: result += "DENIED"; break;
+          case MAV_RESULT_UNSUPPORTED: result += "UNSUPPORTED"; break;
+          case MAV_RESULT_FAILED: result += "FAILED"; break;
+          default: result += "UNKNOWN"; break;
+        }
+        notifyAck(result);
+      }
+    }
+  }
+}
+
+void setupWiFi() {
+#ifdef AP_ONLY_MODE
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(172,217,28,1), IPAddress(172,217,28,1), IPAddress(255,255,255,0));
+#if defined(ARDUINO_ARCH_ESP32)
+  if (WiFi.softAP("pixhawk32-ap", "12345678")) {
+    Serial.println("AP-only mode active: 172.217.28.1");
+  } else {
+    Serial.println("AP setup failed!");
+  }
+#else
+  if (WiFi.softAP("pixhawk8266-ap", "12345678")) {
+    Serial.println("AP-only mode active: 172.217.28.1");
+  } else {
+    Serial.println("AP setup failed!");
+  }
+#endif
+#else
+  WiFi.mode(WIFI_STA);
+  WiFiManager wm;
+#if defined(ARDUINO_ARCH_ESP32)
+  wm.setHostname("pixhawk32");
+  if (!wm.autoConnect("esp32-pixhawk")) {
+    Serial.println("WiFiManager failed, restarting...");
+    ESP.restart();
+  }
+#else
+  wm.setHostname("pixhawk8266");
+  if (!wm.autoConnect("esp8266-pixhawk")) {
+    Serial.println("WiFiManager failed, restarting...");
+    ESP.restart();
+  }
+#endif
+  Serial.println("WiFi connected");
+#endif
+}
+
+void sendSetMode(uint8_t mode) {
+  if (!SerialMAV) return;
+  mavlink_message_t m; uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+  mavlink_msg_set_mode_pack(255, 190, &m, targetSystem, mode, 0);
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &m);
+  SerialMAV.write(buf, len);
+}
+
+void setupServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request){ request->send_P(200, "text/html", INDEX_HTML); });
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest* request){ String s = String("{\"armed\":") + (isArmed?"true":"false") + ",\"mode\":" + String(customMode) + "}"; request->send(200, "application/json", s); });
+  server.on("/arm", HTTP_POST, [](AsyncWebServerRequest* request){ sendMavlinkCommand(400, 1.0f); request->send(200, "application/json", "{\"ok\":true}"); });
+  server.on("/disarm", HTTP_POST, [](AsyncWebServerRequest* request){ sendMavlinkCommand(400, 0.0f); request->send(200, "application/json", "{\"ok\":true}"); });
+  server.on("/mode/rtl", HTTP_POST, [](AsyncWebServerRequest* request){ sendSetMode(6); request->send(200, "application/json", "{\"ok\":true}"); });
+  server.on("/mode/stabilize", HTTP_POST, [](AsyncWebServerRequest* request){ sendSetMode(0); request->send(200, "application/json", "{\"ok\":true}"); });
+  server.on("/mode/alt_hold", HTTP_POST, [](AsyncWebServerRequest* request){ sendSetMode(2); request->send(200, "application/json", "{\"ok\":true}"); });
+  server.onNotFound([](AsyncWebServerRequest* request){ request->send(404, "application/json", "{\"error\":\"not found\"}"); });
+  server.addHandler(&events);
+  server.begin();
+}
 
 void setup() {
-  
   Serial.begin(115200);
-  
-  // Connect to Wi-Fi network with SSID and password
-  Serial.print("Setting AP (Access Point)…");
-  
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(apIP, apIP, netMsk);
-  
-  // Remove the password parameter, if you want the AP (Access Point) to be open
-  WiFi.softAP(ssid, password);
-  
-  dnsServer.start(DNS_PORT, "*", apIP);
-  
-  IPAddress IP = WiFi.softAPIP();
-  
-  Serial.print("AP IP address: ");
-  Serial.println(IP);
-  
-  server.begin();
-
+  setupWiFi();
+#if defined(ARDUINO_ARCH_ESP32)
+  MDNS.begin("pixhawk32");
+  ArduinoOTA.begin();
+  SerialMAV.begin(57600, SERIAL_8N1, MAV_RX_PIN, MAV_TX_PIN);
+#else
+  MDNS.begin("pixhawk8266");
+  ArduinoOTA.begin();
   SerialMAV.begin(57600);
+#endif
+  setupServer();
 }
 
-void loop(){
-  
-  WiFiClient client = server.available();   // Listen for incoming clients
-
-  if (client) {                             // If a new client connects,
-    Serial.println("New Client.");          // print a message out in the serial port
-    String currentLine = "";                // make a String to hold incoming data from the client
-    while (client.connected()) {            // loop while the client's connected
-      if (client.available()) {             // if there's bytes to read from the client,
-        char c = client.read();             // read a byte, then
-        Serial.write(c);                    // print it out the serial monitor
-        header += c;
-        if (c == '\n') {                    // if the byte is a newline character
-          // if the current line is blank, you got two newline characters in a row.
-          // that's the end of the client HTTP request, so send a response:
-          if (currentLine.length() == 0) {
-            // HTTP headers always start with a response code (e.g. HTTP/1.1 200 OK)
-            // and a content-type so the client knows what's coming, then a blank line:
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-type:text/html");
-            client.println("Connection: close");
-            client.println();
-
-            if (header.indexOf("GET /arm") >= 0) {              
-              pixhawk_send_arm();
-              Serial.println("Request for ARM sended to Pixhawk.");
-            } 
-            else if (header.indexOf("GET /disarm") >= 0) {              
-              pixhawk_send_disarm();
-              Serial.println("Request for DISARM sended to Pixhawk.");
-            } 
-            else if (header.indexOf("GET /rtl") >= 0) {
-
-              if(ArmedState == "ARMED") {
-                pixhawk_set_rtl_mode();
-                Serial.println("Request for RTL sended to Pixhawk.");
-              }
-              else Serial.println("Error: Can't set RTL when Disarmed!");
-              
-            }             
-            else if(header.indexOf("GET /") >= 0) {
-              Serial.println("Request for GET /");
-            }           
-
-            // Don't read_pixhawk_incoming_messages for /get_204 and /generate_204 requests;
-            if(header.indexOf("GET /gen_204") >= 0 || header.indexOf("GET //generate_204") >= 0) {
-              Serial.println("Don't read_pixhawk_incoming_messages for /get_204 and /generate_204 requests");
-            }
-            else 
-            {
-              // Read incoming messages from Pixwhawk.            
-              // Задержка для ожидания ответа от Pixhawk
-              // Тут нужен цикл пока не получу ответ.            
-              int starttime = millis();
-              int endtime = starttime;
-                          
-              while((endtime - starttime) <= 1000 || read_pixhawk_incoming_messages_finish) // do this loop for up to 1000mS
-              {
-                read_pixhawk_incoming_messages();
-                endtime = millis();
-              }            
-            }
-            
-            // Start Rendering  HTML Web Page
-
-            client.println("<!DOCTYPE html>");
-            
-            client.println("<html>");
-            client.println("<head>");
-            client.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
-            client.println("<link rel=\"icon\" href=\"data:,\">");
-            client.println("<style>");
-            client.println("html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;");
-            client.println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer; }");
-            client.println(".button { background-color: #64FF64; border: none; color: white; padding: 16px 40px;}");
-            client.println(".button2 { background-color: #FF6464; border: none; color: white; padding: 16px 40px;}");
-            client.println(".button3 {background-color: #646464; border: none; color: white; padding: 16px 40px;}");
-            client.println("</style>");
-            client.println("</head>");
-            
-            client.println("<body>");
-            client.println("<h2>HELI-E 4.2</h2>");
-            
-            // Show pixhawk call status 
-            client.println("<h4 style='color: #FF0000'>");
-            client.println(StatusMessage);
-            client.println("</h4>");           
-            
-            if(ArmedState=="ARMED" && ModeState=="RTL"){
-              client.println("<h2 style='color: #00FF00;'>RTL MODE</h2>");
-            }
-            else{    
-              if (ArmedState=="DISARMED") {
-                client.println("<h3 style='color: #FF0000;'>DISARMED</h3>");
-                client.println("<p><a href=\"/arm\"><button class=\"button\">ARM</button></a></p>");
-              } else if(ArmedState=="ARMED") {
-                client.println("<h3 style='color: #00FF00;'>ARMED</h3>");
-                client.println("<p><a href=\"/disarm\"><button class=\"button button2\">DISARM</button></a></p>");
-                client.println("<p><a href=\"/rtl\"><button class=\"button button3\">RTL</button></a></p>");
-              } 
-            }
-          
-          //  client.println("<script>");
-          //  client.println("setTimeout(function(){ window.location.replace('/'); }, 5000");
-          //  client.println("</script>");
-            
-            client.println("</body>");
-            client.println("</html>");
-            
-            // The HTTP response ends with another blank line
-            client.println();
-            
-            // Break out of the while loop
-            break;
-          } 
-          else { 
-            // if you got a newline, then clear currentLine
-            currentLine = "";
-          }
-        } else if (c != '\r') {  // if you got anything else but a carriage return character,
-          currentLine += c;      // add it to the end of the currentLine
-        }
-      }
-    }
-    
-    // Clear the header variable
-    header = "";
-    StatusMessage = "";
-    
-    // Close the connection
-    client.stop();
-    Serial.println("Client disconnected.");
-    Serial.println("");
-  }
-
-  dnsServer.processNextRequest();
-}
-
-void pixhawk_send_arm() {
-  
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_command_long_pack(0xFF, 0xBE, &msg, 1, 1, 400, 1,1.0,0,0,0,0,0,0);
-
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  SerialMAV.write(buf, len);
-}
-
-void pixhawk_send_disarm() {
-  
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-
-  mavlink_msg_command_long_pack(0xFF, 0xBE, &msg, 1, 1, 400, 1,0.0,0,0,0,0,0,0);
-  
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  SerialMAV.write(buf, len);
-}
-
-void pixhawk_set_stabilize_mode() {
-  
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-  
-  mavlink_msg_set_mode_pack(0xFF, 0xBE, &msg, 1, 209, 0);
-  
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  SerialMAV.write(buf, len);  
-}
-
-void pixhawk_set_rtl_mode() {
-  
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-  
-  mavlink_msg_set_mode_pack(0xFF, 0xBE, &msg, 1, 209, 6);
-  
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  SerialMAV.write(buf, len);  
-}
-
-void pixhawk_set_alt_hold_mode() {
-  
-  mavlink_message_t msg;
-  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-  
-  mavlink_msg_set_mode_pack(0xFF, 0xBE, &msg, 1, 209, 2);
-  
-  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
-  SerialMAV.write(buf, len);  
-}
-
-/* This function gets message from the APM and interprete for Mavlink common messages */
-void read_pixhawk_incoming_messages() {
-  
-  mavlink_message_t msg;
-  mavlink_status_t status;
-
-  //Checks if drone is connected
-  while(SerialMAV.available()) {
-    
-    uint8_t c = SerialMAV.read();
-        
-    // Try to get a new message
-    if(mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) {
-      
-      switch(msg.msgid) {
-
-        case MAVLINK_MSG_ID_HEARTBEAT:  // #0: Heartbeat
-          {
-            // E.g. read GCS heartbeat and go into
-            // comm lost mode if timer times out
-            //Serial.println("MAVLINK_MSG_ID_HEARTBEAT");
-            mavlink_heartbeat_t hb;
-            mavlink_msg_heartbeat_decode(&msg, &hb);
-
-            Serial.print("BASE_MODE: ");
-            Serial.println(hb.base_mode);
-            Serial.print("STATUS: ");
-            
-            switch(hb.base_mode) {
-              case 81:
-              ArmedState = "DISARMED";
-              Serial.println("DISARMED");
-              break;
-              case 89:
-              ArmedState = "DISARMED";
-              Serial.println("DISARMED");              
-              break;
-              case 217:
-              ArmedState = "ARMED";
-              Serial.println("ARMED");              
-              break;
-              case 209:
-              ArmedState = "ARMED";
-              Serial.println("ARMED");              
-              break;
-            }
-            
-            Serial.print("CUSTOM_MODE: ");
-            Serial.println(hb.custom_mode);
-            Serial.print("MODE: ");
-            
-            switch(hb.custom_mode) {
-              case 0:
-                ModeState = "STABILIZE";
-                Serial.println("STABILIZE");
-              break;
-              case 3:
-                ModeState = "AUTO";
-                Serial.println("AUTO");
-              break;
-              case 6:
-                ModeState = "RTL";
-                Serial.println("RTL");
-              break;              
-              default:
-                Serial.println("UNKNOWN MODE");
-              break;
-            }
-            
-          }
-          break;
-
-          case MAVLINK_MSG_ID_COMMAND_ACK: // #77
-          {
-            mavlink_command_ack_t cmd_ack;
-            mavlink_msg_command_ack_decode(&msg, &cmd_ack);
-
-            Serial.println("--------------------------------");
-            Serial.println("MAVLINK_MSG_ID_COMMAND_ACK #77");
-            
-            Serial.print("command = ");
-            Serial.println(cmd_ack.command);
-            Serial.print("result = ");
-            Serial.println(cmd_ack.result);
-            Serial.println("--------------------------------");
-            
-            StatusMessage = "";                     
-
-            if(cmd_ack.command == 11 && cmd_ack.result == 3){
-              StatusMessage = "Flight mode change failed.";
-            }
-            else if(cmd_ack.command == 400 && cmd_ack.result == 0){
-              StatusMessage = "";
-            }
-            else {
-              StatusMessage.concat("CMD_ACK: CMD:");
-              StatusMessage.concat(cmd_ack.command);
-              StatusMessage.concat(" RSLT:");
-              StatusMessage.concat(cmd_ack.result);
-            }
-
-            read_pixhawk_incoming_messages_finish = true;
-          }
-          
-          break;
-          
-      }
-    }
-  }
+void loop() {
+  ArduinoOTA.handle();
+  handleMavlink();
 }
