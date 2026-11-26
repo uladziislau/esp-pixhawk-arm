@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "project": "esp-pixhawk-arm",
+  "remote": "uladziislau/esp-pixhawk-arm",
+  "class": "research",
+  "lifecycle": "frozen",
+  "stateSource": {
+    "type": "backlog",
+    "path": "data/modules/development/tasks.development.json"
+  },
+  "adapter": {
+    "type": "data-only"
+  }
+}
